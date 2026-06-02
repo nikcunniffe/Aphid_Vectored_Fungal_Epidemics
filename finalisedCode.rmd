@@ -1,0 +1,697 @@
+---
+title: "Fungal secondary metabolism determines aphid vector competence"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(deSolve)
+library(fields)
+library(sfsmisc)
+library(extrafont)
+library(RColorBrewer)
+loadfonts(device="all")
+myFont <- "sans" 
+```
+
+This R markdown file contains R code used in the epidemiological modelling component of Simon et al. (2026) "Fungal secondary metabolism determines aphid vector competence".
+
+All figures in the paper can be produced using this file.
+
+```{r echo=F,odeRHS}
+fullModel <- function(t, y, par)
+{
+  # extract state variables
+  S <- y[1]
+  I <- y[2]
+  X <- y[3]
+  Z <- y[4]
+  
+  # extract parameters
+  mu <- par$mu
+  K <- par$K
+  r <- par$r
+  Gamma <- par$Gamma
+  alpha <- par$alpha
+  v <- par$v
+  a <- par$a
+  beta <- par$beta
+  eta <- par$eta
+  c <- par$c
+  M <- par$M
+  # new parameter for Z to avoid I
+  delta <- par$delta
+  
+  dS <- mu * (K - (S + I)) - r * I * S / K - (beta / Gamma) * (delta*S/(delta*S + I)) * Z
+  dI <- r * I * S / K + (beta / Gamma) * (delta*S/(delta*S + I)) * Z
+  
+  dX <- a * (X + Z) * (1 - (X+Z)/M) - (alpha/Gamma) * ((v * I)/(S + v * I)) * X + eta * Z - c * X
+  dZ <- (alpha/Gamma) * ((v * I)/(S + v * I)) * X - eta * Z - c * Z
+
+  # return
+  return(list(c(dS, 
+                dI,
+                dX,
+                dZ)))
+}
+
+#
+# if type = 1 then return both infection pathways
+#    type = 2 then just aerial
+#    type = 3 then just aphids
+#
+rateChangeInfFromODESoln <- function(odeSoln, par, type)
+{
+  S <- odeSoln['S']
+  I <- odeSoln['I']
+  Z <- odeSoln['Z']
+  
+  r <- par$r
+  K <- par$K
+  beta <- par$beta
+  Gamma <- par$Gamma
+  delta <- par$delta
+  v <- par$v
+
+  if(type==1)
+  {
+    thisRet <- r * I * S / K + (beta / Gamma) * (delta * S/(delta * S + I)) * Z  
+  }
+  if(type==2)
+  {
+    thisRet <- r * I * S / K 
+  }
+  if(type==3)
+  {
+    thisRet <- (beta / Gamma) * (delta * S/(delta * S + I)) * Z  
+  }
+  
+  return(thisRet[,1])
+}
+
+severityFromLambda <- function(t, thisL, par)
+{
+  zetaZero <- par$zetaZero
+  omega <- par$omega
+  mu <- par$mu
+  rho <- par$rho
+  K <- par$K
+  
+  nT <- length(t)
+  retVal <- numeric(nT)
+  if(nT > 1)
+  {
+    deltaT <- t[2] - t[1]
+    for(i in 2:nT)
+    {
+      thisVal <- 0
+      for(j in 1:(i-1))
+      {
+        thisTau <- t[j]
+        thisSev <- 1/(1 + (1/zetaZero - 1) * exp(-omega * thisTau))
+        thisRate <- thisL[i - j] / K
+        thisVal <- thisVal + thisRate * thisSev * deltaT
+      }
+      retVal[i] <- thisVal
+    }
+  }
+  return(retVal)
+}
+```
+
+## Parameterisation of epidemiological model
+
+Report the default parameterisation
+```{r defParams}
+# parameters
+defParamNIV <- list(K = 300,     # carrying capacity for spikes per unit area
+                    mu = 0.1,    # rate of production of spikes
+                    r = 0.15,    # aerial infection rate
+                    Gamma = 1,   # time an aphid feeds for
+                    alpha = 0.5, # probability aphid picks up fungus per visit
+                    beta = 0.5,  # probability aphid transmits fungus per visit
+                    v = 1.2,     # vector preference (fungus-free vectors to infected plants)
+                    a = 0.5,     # aphid birth rate  
+                    eta = 0.2,   # rate of loss of infectivity 
+                    c = 0.2,     # death rate of aphids
+                    M = 800,     # "carrying capacity" of aphids per unit area 
+                    delta = 1.5, # vector preference (fungus-carrying vectors to healthy plants)
+                    # Severity parameters calculated by model fitting below
+                    omega = 0.25,      # rate at which severity increases on a spike
+                    zetaZero = 0.034)  # initial proportion of spikelets infected
+
+defParamDON <- defParamNIV
+# Three changes for DON relative to NIV:
+#     - 1% as likely to pick up fungus from infected head as NIV
+#     - 50% as likely to choose infected head as NIV 
+#     - 50% more transmissible via aerial spread
+defParamDON$alpha <- 0.01 * defParamNIV$alpha
+defParamDON$v <- 0.5 * defParamNIV$v
+defParamDON$r <- 1.5 * defParamNIV$r
+defParamDON$delta <- 1.0
+```
+
+## Figures 
+
+The following code generates the following figures (in order)
+
+- Extended Data Figure 9. Panel (a)
+- Extended Data Figure 9. Panel (b)
+- Figure 4. Panel (f)
+- Figure 4. Panel (g)
+- Extended Data Figure 9. Panel (c)
+- Extended Data Figure 9. Panel (d)
+- Extended Data Figure 9. Panel (e)
+- Extended Data Figure 9. Panel (f)
+
+
+
+```{R echo=F,compareNIVDONAlpha,fig.height = 4,fig.align = 'center'}
+# initial conditions
+yZero <- c(S = 5, 
+           I = 1,
+           X = 0.1, 
+           Z = 0) 
+
+tMax <- 60
+tMaxSev <- tMax
+for(i in 1:2)
+{
+  if(i == 1)
+  {
+    thisP <- defParamNIV
+    sType <- "NIV"
+  }else{
+    thisP <- defParamDON
+    sType <- "DON"
+  }
+  
+  odeRet <- data.frame(ode(y = yZero, 
+                           times = seq(0,tMax,length.out=101), 
+                           func = fullModel, 
+                           parms = thisP, 
+                           method = "ode23"))
+  
+  if(i==1)
+  {
+    odeRetNIV <- odeRet
+  }else{
+    odeRetDON <- odeRet
+  }
+  
+  if(T)
+  {
+    tSev <- seq(0,tMaxSev,by=0.1)
+    
+    thisOmega <- 1/(1 + (1/thisP$zetaZero - 1) * exp(-thisP$omega * tSev))
+    thisLambda <- rateChangeInfFromODESoln(odeRet,thisP,1)
+
+    thisLambdaAerial <- rateChangeInfFromODESoln(odeRet,thisP,2)
+    thisLambdaAphid <- rateChangeInfFromODESoln(odeRet,thisP,3)
+
+    thisSev <- severityFromLambda(odeRet$time,thisLambda,thisP)
+
+    if(i==1)
+    {
+      sevNIV <- thisSev
+    }else{
+      sevDON <- thisSev
+    }
+  }  
+}
+
+
+
+par(las=1)
+par(mfrow = c(1,2))
+par(family=myFont)
+
+plot(odeRetNIV$time,
+     odeRetNIV$I,
+     ty="l",
+     col="darkred",
+     lwd=2,
+     xlab="t, time (days)",
+     ylab="Heads per square metre",
+     main="Infected head density",
+     ylim=c(0,thisP$K),
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(10/12))
+lines(odeRetDON$time,
+      odeRetDON$I,
+      lwd=2,
+      col="firebrick2")
+legend("topleft",
+       c("NIV","DON"),
+       col=c("darkred","firebrick2"),
+       lwd=2,
+       lty=1,
+       cex=(9/12))
+
+plot(odeRetNIV$time,
+     sevNIV,
+     ty="l",
+     col="darkred",
+     lwd=2,
+     xlab="t, time (days)",
+     ylab="Proportion of infected heads",
+     main="Severity on heads",
+     ylim=c(0,1),
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(10/12))
+
+lines(odeRetDON$time,
+      sevDON,
+      lwd=2,
+      col="firebrick2")
+if(F)
+{
+  legend("topleft",
+         c("NIV","DON"),
+         col=c("darkred","firebrick2"),
+         lwd=2,
+         lty=1)
+}
+
+for(i in 1:2)
+{
+	if(i == 1)
+	{
+		odeRet <- odeRetDON
+		sType <- "DON"
+	}else{
+		odeRet <- odeRetNIV
+		sType <- "NIV"
+	}
+    tSev <- seq(0,tMaxSev,by=0.1)
+    
+    sTmp <- sprintf("Infection rates (%s)",sType)
+
+    thisLambda <- rateChangeInfFromODESoln(odeRet,thisP,1)
+    plot(odeRet$time,
+         thisLambda,
+         lwd=2,
+         ty="l",
+         xlab="t, time (days)",
+         ylab="Heads per square metre per day",
+         col="purple",
+         main=sTmp,
+         ylim=c(0,40),
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(10/12))
+  
+    thisLambdaAerial <- rateChangeInfFromODESoln(odeRet,thisP,2)
+    thisLambdaAphid <- rateChangeInfFromODESoln(odeRet,thisP,3)
+
+    lines(odeRet$time,
+        thisLambdaAerial,
+        lwd=2,
+        col="cyan4",
+        lty=2)
+    
+    lines(odeRet$time,
+        thisLambdaAphid,
+        lwd=2,
+        lty=2,
+        col="pink")
+
+    if(i == 1)
+    {
+    legend("topleft",
+           c("Splash dispersed+Vectored","Splash dispersed","Vectored"),
+           col=c("purple","cyan4","pink"),
+           lwd=2,
+           lty=c(1,2,2),cex=(9/12))
+    }
+}
+
+plot(NULL, xlim=c(0,1), ylim=c(0,1), ylab="", xlab="",xaxt="n",yaxt="n",
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(10/12),bty="n")
+
+legend("top",
+      c("Severity (NIV-like)", "AUDPC (NIV-like)", "Default value (NIV)", "Severity (DON-like)", "AUDPC (DON-like)", "Default value (DON)"), 
+      col=c("darkgreen","lightgreen","black","darkblue","dodgerblue","grey"),
+           lwd=2,
+           ncol=1,
+           lty=c(1,1,1,1,1),bty="n",cex=(9/12))    
+
+
+allAlpha <- seq(0,1.0,by=0.05)
+allV <- seq(0.0,2,by=0.025)
+allR <- seq(0,0.5,by=0.01)
+allDelta <- seq(0.0,2,by=0.025)
+for(i in 1:4)
+{
+  if(i == 1)
+  {
+    allP <- allAlpha
+    paramStr <- expression(alpha*", Acquisition probability")
+    sLegStrNIV <- expression("Default "*alpha*" (NIV)")
+    sLegStrDON <- expression("Default "*alpha*" (DON)")
+    thisName <- "alpha"
+    thisDefNIVVal <- defParamNIV$alpha
+    thisDefDONVal <- defParamDON$alpha
+    titleStr <- expression("Sensitivity to "*alpha)
+  }
+  if(i == 2)
+  {
+    allP <- allR
+    paramStr <- expression(r*", Splash dispersal infection rate (/day)")
+    sLegStrNIV <- expression("Default "*r*" (NIV)")
+    sLegStrDON <- expression("Default "*r*" (DON)")
+    thisName <- "r"
+    thisDefNIVVal <- defParamNIV$r
+    thisDefDONVal <- defParamDON$r
+    titleStr <- expression("Sensitivity to "*r)
+  }
+  if(i == 3)
+  {
+    allP <- allV
+#    paramStr <- expression(nu["-"]*", Unexposed aphid bias to infected heads")
+    paramStr <- expression(nu*", Unexposed aphid bias to infected heads")
+    sLegStrNIV <- expression("Default "*nu*" (NIV)")
+    sLegStrDON <- expression("Default "*nu*" (DON)")
+    thisName <- "nu"
+    thisDefNIVVal <- defParamNIV$v
+    thisDefDONVal <- defParamDON$v
+    titleStr <- expression("Sensitivity to "*nu)
+  }
+  if(i == 4)
+  {
+    allP <- allDelta
+#    paramStr <- expression(nu["-"]*", Unexposed aphid bias to infected heads")
+    paramStr <- expression(delta*", Exposed aphid bias to healthy heads")
+    sLegStrNIV <- expression("Default "*delta*" (NIV)")
+    sLegStrDON <- expression("Default "*delta*" (DON)")
+    thisName <- "delta"
+    thisDefNIVVal <- defParamNIV$delta
+    thisDefDONVal <- defParamDON$delta
+    titleStr <- expression("Sensitivity to "*delta)
+  }
+  allNIVSev <- numeric(length(allP))
+  allNIVAUDPC <- numeric(length(allP))
+  allDONSev <- numeric(length(allP))
+  allDONAUDPC <- numeric(length(allP))
+  for(j in 1:length(allP))
+  {
+    thisParamNIV <- defParamNIV
+    thisParamDON <- defParamDON
+    
+    if(thisName == "alpha")
+    {
+      thisParamNIV$alpha <- allP[j]
+      thisParamDON$alpha <- allP[j]
+    }
+    
+    if(thisName == "r")
+    {
+      thisParamNIV$r <- allP[j]
+      thisParamDON$r <- allP[j]
+    }
+    
+    if(thisName == "nu")
+    {
+      thisParamNIV$v <- allP[j]
+      thisParamDON$v <- allP[j]
+    }
+
+    if(thisName == "delta")
+    {
+      thisParamNIV$delta <- allP[j]
+      thisParamDON$delta <- allP[j]
+    }
+        
+    odeRetNIV <- data.frame(ode(y = yZero, 
+                           times = seq(0,tMax,length.out=101), 
+                           func = fullModel, 
+                           parms = thisParamNIV, 
+                           method = "ode23"))
+  
+    thisLambdaNIV <- rateChangeInfFromODESoln(odeRetNIV,thisParamNIV,1)
+
+    thisSevNIV <- severityFromLambda(odeRetNIV$time,thisLambdaNIV,thisParamNIV)
+
+    thisAUDPCNIV <- integrate.xy(odeRetNIV$time, thisSevNIV)/(max(odeRetNIV$time)-min(odeRetNIV$time))
+    
+    odeRetDON <- data.frame(ode(y = yZero, 
+                           times = seq(0,tMax,length.out=101), 
+                           func = fullModel, 
+                           parms = thisParamDON, 
+                           method = "ode23"))
+
+    thisLambdaDON <- rateChangeInfFromODESoln(odeRetDON,thisParamDON,1)
+
+    thisSevDON <- severityFromLambda(odeRetDON$time,thisLambdaDON,thisParamDON)
+
+    thisAUDPCDON <- integrate.xy(odeRetDON$time, thisSevDON)/(max(odeRetDON$time)-min(odeRetDON$time))
+  
+    allNIVSev[j] <- thisSevNIV[length(thisSevNIV)]
+    allDONSev[j] <- thisSevDON[length(thisSevNIV)]
+    allNIVAUDPC[j] <- thisAUDPCNIV
+    allDONAUDPC[j] <- thisAUDPCDON
+
+  }
+  if(F)
+  {
+    print(thisName)
+    print(allP)
+    print(allNIVSev)
+    print(allDONSev)
+    print(allNIVAUDPC)
+    print(allDONAUDPC)
+  }  
+  plot(allP,
+       allNIVSev,
+       col="darkgreen",
+       xlab=paramStr,
+       ylab="Severity (at 60 days) & AUDPC",
+       main=titleStr,
+       ty="l",
+       lwd=2,
+       ylim=c(0,1),
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(11/12))
+  
+  lines(c(thisDefNIVVal,thisDefNIVVal),c(-1,2),lwd=2,col="black")
+  lines(c(thisDefDONVal,thisDefDONVal),c(-1,2),lwd=2,col="grey")
+ 
+  lines(allP,allNIVSev,lwd=2,col="darkgreen") # replot so overlays
+  lines(allP,allDONSev,lwd=2,col="darkblue")
+  lines(allP,allNIVAUDPC,lwd=2,col="lightgreen")
+  lines(allP,allDONAUDPC,lwd=2,col="dodgerblue")
+  
+#  lines(c(thisDefNIVVal,thisDefNIVVal),c(-1,2),lwd=2,col="black")
+#  lines(c(thisDefDONVal,thisDefDONVal),c(-1,2),lwd=2,col="grey")
+}
+```
+
+Find and report severity and AUPDC for default values with NIV and DON
+
+```{R echo=F}
+
+thisParamNIV <- defParamNIV
+thisParamDON <- defParamDON
+odeRetNIV <- data.frame(ode(y = yZero, 
+                       times = seq(0,tMax,length.out=101), 
+                       func = fullModel, 
+                       parms = thisParamNIV, 
+                       method = "ode23"))
+
+thisLambdaNIV <- rateChangeInfFromODESoln(odeRetNIV,thisParamNIV,1)
+
+thisSevNIV <- severityFromLambda(odeRetNIV$time,thisLambdaNIV,thisParamNIV)
+
+thisAUDPCNIV <- integrate.xy(odeRetNIV$time, thisSevNIV)/(max(odeRetNIV$time)-min(odeRetNIV$time))
+
+odeRetDON <- data.frame(ode(y = yZero, 
+                       times = seq(0,tMax,length.out=101), 
+                       func = fullModel, 
+                       parms = thisParamDON, 
+                       method = "ode23"))
+
+thisLambdaDON <- rateChangeInfFromODESoln(odeRetDON,thisParamDON,1)
+
+thisSevDON <- severityFromLambda(odeRetDON$time,thisLambdaDON,thisParamDON)
+
+thisAUDPCDON <- integrate.xy(odeRetDON$time, thisSevDON)/(max(odeRetDON$time)-min(odeRetDON$time))
+
+print(paste("NIV: Sev =",thisSevNIV[length(thisSevNIV)],"AUDPC =",thisAUDPCNIV))
+print(paste("DON: Sev =",thisSevDON[length(thisSevDON)],"AUDPC =", thisAUDPCDON))
+```
+
+## Parameterising within-spike severity
+
+The following code generates the following figures (in order)
+
+- Extended Data Figure 9. Panel (g)
+- Extended Data Figure 9. Panel (h)
+
+The results of this code, i.e., the best fitting parameters
+
+- $\zeta_0 = 0.034$ (severity at time of first infection) 
+- $\omega = 0.25$ day$^{-1}$ (rate of increase of severity). 
+
+are used in generating the figures above.
+
+Note that for two samples in the data file used for fitting the logistic response (Within Head Severity Data.xlsx) the severity decreases between 11 and 13 days. These samples are filtered out before doing the fit.
+
+```{R echo=F,fitSevCurve,fig.height = 4,fig.align = 'center'}
+logFunc <- function(time, zetaZero, omega)
+{
+  thisOmega <- 1 /(1 + (1/zetaZero - 1) * exp(-omega * time))
+  return(thisOmega)
+}
+
+lsFitTwoParam <- function(v)
+{
+  paramOne <- v[1]
+  paramTwo <- v[2]
+  
+  sumSq <- 0
+  for(i in 1:length(allDataS))
+  {
+    thisE <- logFunc(allDataT[i],paramOne,paramTwo) - allDataS[i]
+    sumSq <- sumSq + thisE * thisE  
+  }
+  return(sumSq)
+}
+
+newData <- read_excel("Within Head Severity Data.xlsx", sheet = "Sheet1")
+par(las=1)
+par(family=myFont)
+par(mfrow = c(1,2))
+plot(-100,
+     -100,
+     pch=20,
+     col="red",
+     main="Within-head severity",
+     xlab=expression("Time post infection ("*tau*", days)"),
+     ylab=expression("Normalised severity ( "*sigma(tau)*")"),
+     ylim=c(0,1),
+     xlim=c(0,30),
+     cex.lab=(11/12),
+     cex.axis=(10/12),
+     cex.main=(10/12))
+
+newData$`5dai Severity %` <- newData$`5dai Severity %`/100
+newData$`7dai Severity %` <- newData$`7dai Severity %`/100
+newData$`9dai Severity %` <- newData$`9dai Severity %`/100
+newData$`11daiSeverity %` <- newData$`11daiSeverity %`/100
+newData$`13dai Disease+Bleached Severity %` <- newData$`13dai Disease+Bleached Severity %`/100
+
+goodIDX <- NULL
+for(i in 1:nrow(newData))
+{
+  allX <- c(5,7,9,11,13)
+  allY <- c(newData[i,]$`5dai Severity %`,newData[i,]$`7dai Severity %`,newData[i,]$`9dai Severity %`,newData[i,]$`11daiSeverity %`,newData[i,]$`13dai Disease+Bleached Severity %`)
+  if(newData[i,]$`7dai Severity %` >= newData[i,]$`5dai Severity %`)
+  {
+    if(newData[i,]$`9dai Severity %` >= newData[i,]$`7dai Severity %`)
+    {
+      if(newData[i,]$`11daiSeverity %` >= newData[i,]$`9dai Severity %`)
+      {
+        if(newData[i,]$`13dai Disease+Bleached Severity %` >= newData[i,]$`11daiSeverity %`)
+        {
+          goodIDX <- c(goodIDX,i)
+          lines(allX,allY,col="grey")
+        }else{
+          print(paste("Filtered sample",newData[i,]$Sample,"since severity drops from 11 to 13 days"))
+        }
+      }else{
+          print(paste("Filtered sample",newData[i,]$Sample,"since severity drops from 9 to 11 days"))
+      }
+    }else{
+      print(paste("Filtered sample",newData[i,]$Sample,"since severity drops from 7 to 9 days"))
+    }
+  }else{
+    print(paste("Filtered sample",newData[i,]$Sample,"since severity drops from 5 to 7 days"))
+  }
+}
+
+myStdErr <- function(x)
+{
+  return(sqrt(var(x)/length(x)))
+}
+
+allDataS <- c(mean(newData$`5dai Severity %`[goodIDX]),
+             mean(newData$`7dai Severity %`[goodIDX]),
+             mean(newData$`9dai Severity %`[goodIDX]),
+             mean(newData$`11daiSeverity %`[goodIDX]),
+             mean(newData$`13dai Disease+Bleached Severity %`[goodIDX]))
+allDataStdE <- c(myStdErr(newData$`5dai Severity %`[goodIDX]),
+                 myStdErr(newData$`7dai Severity %`[goodIDX]),
+                 myStdErr(newData$`9dai Severity %`[goodIDX]),
+                 myStdErr(newData$`11daiSeverity %`[goodIDX]),
+                 myStdErr(newData$`13dai Disease+Bleached Severity %`[goodIDX]))
+
+allDataT <- seq(5,13,by=2)
+for(i in 1:length(allDataS))
+{
+  points(allDataT[i],allDataS[i],cex=2,col="black",pch=20)
+  lines(c(allDataT[i],allDataT[i]),c(allDataS[i]-1.96*allDataStdE[i],allDataS[i]+1.96*allDataStdE[i]),lwd=3)
+  lines(c(allDataT[i]-0.25,allDataT[i]+0.25),c(allDataS[i]-1.96*allDataStdE[i],allDataS[i]-1.96*allDataStdE[i]),lwd=3)
+  lines(c(allDataT[i]-0.25,allDataT[i]+0.25),c(allDataS[i]+1.96*allDataStdE[i],allDataS[i]+1.96*allDataStdE[i]),lwd=3)
+}
+t <- seq(0,30,by=1)
+
+vTmp <- optim(c(0.1,0.2),lsFitTwoParam)
+vTmpTwo <- vTmp
+
+lines(t,
+     logFunc(t,vTmp$par[1],vTmp$par[2]),
+     lwd=3,
+     col="dodgerblue")
+
+legend("bottomright",
+       legend=c("Data","Fit",expression("Mean"%+-%"SE")),
+       col=c("grey","dodgerblue","black"),
+       lwd=c(1,3,3),
+       pch=c(NA,NA,20),cex=(9/12))
+
+allZeta <- seq(0.01,0.1,by=0.01/2)
+nZeta <- length(allZeta)
+allOmega <- seq(0.05,0.4,by=0.05/2)
+nOmega <- length(allOmega)
+allLS <- matrix(NA,nrow=nZeta,ncol=nOmega)
+for(i in 1:nZeta)
+{
+  for(j in 1:nOmega)
+  {
+    v <- c(allZeta[i],allOmega[j])
+    allLS[i,j] <- lsFitTwoParam(v)
+  }
+}
+
+rf <- colorRampPalette(rev(brewer.pal(9,'YlGnBu')))   # make colors
+r <- rf(64)
+
+image.plot(allZeta,
+           allOmega,
+           allLS,
+           xlab=expression("Initial severity ("*zeta[0]*")"),
+           ylab=expression("Rate of increase ("*omega*")"),
+           main="Sum of squares",
+           cex.lab=(11/12),
+           cex.axis=(10/12),
+           cex.main=(10/12),
+           col=r,
+           legend.lab="SS",
+           axis.args=list(cex.axis=0.7))
+points(vTmp$par[1],vTmp$par[2],pch=20,col="white",cex=2)
+print(vTmp)
+
+print("Rounded to 2 significant figures, the best fitting parameters are:")
+s<-sprintf("Zeta0=%.3f",vTmp$par[1])
+print(s)
+s<-sprintf("Omega=%.2f",vTmp$par[2])
+print(s)
+
+```
+
